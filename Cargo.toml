@@ -1,0 +1,17 @@
+[package]
+name = "spatz_indicator_controller"
+version = "0.1.0"
+edition = "2021"
+
+[target.thumbv6m-none-eabi]
+runner = "elf2uf2-rs -d"
+
+[dependencies]
+rp-pico = "0.5.0"
+embedded-hal = "0.2.7"
+panic-halt = "*"
+cortex-m-rt = "*"
+cortex-m = "*"
+fugit = "*"
+ws2812-pio = "*"
+smart-leds = "*"
