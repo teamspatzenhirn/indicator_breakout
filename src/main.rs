@@ -13,11 +13,10 @@ use embedded_hal::digital::v2::OutputPin;
 // be linked)
 use panic_halt as _;
 
-use rp_pico::hal::clocks::init_clocks_and_plls;
 use rp_pico::hal::gpio::{Function, Pin, I2C};
 use rp_pico::hal::i2c::peripheral::I2CEvent;
 
-use rp_pico::hal::{i2c, prelude::*, Timer, Watchdog};
+use rp_pico::hal::{prelude::*, Timer, Watchdog};
 
 use rp_pico::hal::pac;
 
@@ -144,7 +143,6 @@ fn main() -> ! {
         hal::I2C::new_peripheral_event_iterator(pac.I2C1, sda, scl, &mut pac.RESETS, 0x003);
 
     let mut t = 0u32;
-    let mut last_start = 0u32;
     let mut mode = Mode::Off;
     let mut brake = false;
 
