@@ -26,70 +26,42 @@ use ws2812_pio::Ws2812;
 
 use rtic::app;
 
-trait Decrement {
-    fn decrement(&mut self) -> IndicatorState;
-}
-
-fn decrement(dur: &mut IndicatorDuration) {
-    match dur {
-        IndicatorDuration::INFINITE => {}
-        IndicatorDuration::FINITE(n) if *n > 0 => *n -= 1,
-        IndicatorDuration::FINITE(n) => {}
-    }
-}
-
-impl Decrement for RustIndicatorCommand {
-    fn decrement(&mut self) -> IndicatorState {
-        let current_state: IndicatorState;
-        match self {
-            RustIndicatorCommand::OFF => current_state = IndicatorState::OFF,
-            RustIndicatorCommand::LEFT(n) => {
-                current_state = IndicatorState::LEFT;
-                decrement(n);
-            }
-            RustIndicatorCommand::RIGHT(n) => {
-                current_state = IndicatorState::RIGHT;
-                decrement(n);
-            }
-            RustIndicatorCommand::BOTH(n) => {
-                current_state = IndicatorState::BOTH;
-                decrement(n);
-            }
-        }
-        return current_state;
-    }
-}
 #[app(device=rp_pico::hal::pac, dispatchers=[SW0_IRQ, SW1_IRQ, SW2_IRQ])]
 mod app {
-    use fugit::ExtU64;
-
+    use crate::animation::{self};
     use embedded_hal::digital::v2::ToggleableOutputPin;
-
+    use fugit::ExtU64;
     use indicator_interface::{IndicatorState, RustIndicatorCommand};
+    use rp2040_hal::pio::PIOExt;
+    use rp2040_hal::Clock;
     use rp_pico::{
         hal::{
             self,
             gpio::{pin::bank0::*, Pin, PushPullOutput},
-            timer::{monotonic::*, Alarm0},
+            pio::SM0,
+            timer::{monotonic::*, Alarm0, CountDown},
             Watchdog,
         },
         XOSC_CRYSTAL_FREQ,
     };
 
-    use crate::animation::AnimationState;
+    use smart_leds::SmartLedsWrite;
+    use ws2812_pio::Ws2812;
 
     #[monotonic(binds = TIMER_IRQ_0, default=true)]
     type MyMono = Monotonic<Alarm0>;
 
     #[shared]
     struct Shared {
-        animation_state: AnimationState,
-        command: RustIndicatorCommand,
+        next_command: RustIndicatorCommand,
+        brakelight: bool,
     }
 
     #[local]
-    struct Local {
+    struct Local<'a> {
         led: Pin<Gpio25, PushPullOutput>,
+        led_strip: Ws2812<rp2040_hal::pac::PIO0, SM0, rp2040_hal::timer::CountDown<'a>, Gpio4>,
+        frame_delay: cortex_m::delay::Delay,
     }
 
     #[init]
@@ -101,7 +73,7 @@ mod app {
         }
         let mut resets = c.device.RESETS;
         let mut watchdog = Watchdog::new(c.device.WATCHDOG);
-        hal::clocks::init_clocks_and_plls(
+        let clocks = hal::clocks::init_clocks_and_plls(
             XOSC_CRYSTAL_FREQ,
             c.device.XOSC,
             c.device.CLOCKS,
@@ -126,39 +98,71 @@ mod app {
         );
         let led_pin = pins.led.into_push_pull_output();
 
+        // Split the PIO state machine 0 into individual objects, so that
+        // Ws2812 can use it:
+        let (mut pio, sm0, _, _, _) = c.device.PIO0.split(&mut resets);
+
+        let led_strip = Ws2812::new(
+            // Use pin 6 on the Raspberry Pi Pico (which is GPIO4 of the rp2040 chip)
+            // for the LED data output:
+            pins.gpio4.into_mode(),
+            &mut pio,
+            sm0,
+            clocks.peripheral_clock.freq(),
+           timer.count_down(),
+        );
+
+        let frame_delay =
+            cortex_m::delay::Delay::new(c.core.SYST, clocks.system_clock.freq().to_Hz());
+
         blink_task::spawn().unwrap();
 
         (
             Shared {
-                animation_state: AnimationState::off(),
-                command: RustIndicatorCommand::OFF,
+                next_command: RustIndicatorCommand::OFF,
+                brakelight: false,
             },
-            Local { led: led_pin },
+            Local {
+                led: led_pin,
+                led_strip,
+                frame_delay,
+            },
             init::Monotonics(Monotonic::new(timer, alarm)),
         )
     }
 
-    #[task(shared=[command], priority=2)]
-    fn indicate_task(mut c: indicate_task::Context) {
-        let mut mode = IndicatorState::OFF;
-        use crate::Decrement;
-        c.shared.command.lock(|command| mode = command.decrement());
-        let mode = mode;
+    #[task(shared=[next_command, brakelight],local=[led_strip, frame_delay], priority=2)]
+    fn indicate_task(mut c: indicate_task::Context, mode: IndicatorState) {
+        // TODO: play animation
 
-        // spawn first render task
+        let mut leds: [smart_leds::RGB8; animation::STRIP_LEN] =
+            [(0, 0, 0).into(); animation::STRIP_LEN];
+
+        let end_t = monotonics::now() + animation::Duration::millis(animation::ANIMATION_DURATION_ms);
+
+        let mut i = 0;
+
+        while monotonics::now() < end_t {
+            let mut brake = false;
+            c.shared.brakelight.lock(|bl| brake = *bl);
+
+            animation::calculate_frame(&mut leds, i, &mode, brake);
+            c.local
+                .led_strip
+                .write(smart_leds::brightness(leds.iter().copied(), 20))
+                .unwrap();
+
+            c.local.frame_delay.delay_ms(5);
+        }
+
+        // TODO: start task for next command, decrement command
     }
 
-    #[task(shared=[animation_state], priority=3)]
-    fn animation_render_task(_: animation_render_task::Context) {
-        // if(there is a next frame):
-        animation_render_task::spawn_after(50.millis()).unwrap();
-        //animation_render_task::
-
-        // TODO: render frame
+    #[task(binds=I2C1_IRQ, priority=4, shared=[next_command,  brakelight])]
+    fn i2c_receive_task(_: i2c_receive_task::Context) {
+        // TODO: update next task
+        // TODO: update brakelight
     }
-
-    #[task(binds=I2C1_IRQ, priority=4)]
-    fn i2c_receive_task(_: i2c_receive_task::Context) {}
 
     #[task(local=[led], priority=1)]
     fn blink_task(c: blink_task::Context) {
@@ -280,6 +284,6 @@ fn main() -> ! {
             .unwrap();
 
         frame_delay.delay_ms(5);
-        t = (t + 5) % animation::FRAME_DURATION;
+       // t = (t + 5) % animation::FRAME_DURATION;
     }
 }
