@@ -1,10 +1,9 @@
 #![no_std]
 #![no_main]
 
-use core::cmp::min;
+mod animation;
 
-// The macro for our start-up function
-use rp_pico::entry;
+use indicator_interface::{IndicatorDuration, IndicatorState, RustIndicatorCommand};
 
 // GPIO traits
 use embedded_hal::digital::v2::OutputPin;
@@ -22,59 +21,155 @@ use rp_pico::hal::pac;
 
 use rp_pico::hal;
 
-use smart_leds::{brightness, colors, SmartLedsWrite, RGB8};
+use smart_leds::{brightness, SmartLedsWrite, RGB8};
 use ws2812_pio::Ws2812;
 
-const STRIP_LEN: usize = 16 * 3;
+use rtic::app;
 
-#[derive(Clone, Copy)]
-enum Mode {
-    Left,
-    Right,
-    Both,
-    Off,
+trait Decrement {
+    fn decrement(&mut self) -> IndicatorState;
 }
 
-const FRAME_DURATION: u32 = 500;
-const HOLD_DURATION: u32 = 250;
-const FADE_DURATION: u32 = FRAME_DURATION - HOLD_DURATION;
-
-fn calculate_frame(buf: &mut [RGB8; STRIP_LEN], t: u32, mode: Mode, brake: bool) {
-    buf.fill(colors::BLACK);
-
-    match mode {
-        Mode::Left => {
-            let progress = min(16, 16 * t / FADE_DURATION) as usize;
-            buf[32..32 + progress].fill(colors::YELLOW);
-        }
-        Mode::Right => {
-            let progress = min(16, 16 * t / FADE_DURATION) as usize;
-            buf[16 - progress..16].fill(colors::YELLOW);
-        }
-        Mode::Both => {
-            buf[0..16].fill(if t < FRAME_DURATION / 2 {
-                colors::YELLOW
-            } else {
-                colors::BLACK
-            });
-
-            buf[STRIP_LEN - 16..STRIP_LEN].fill(if t < FRAME_DURATION / 2 {
-                colors::YELLOW
-            } else {
-                colors::BLACK
-            });
-        }
-        Mode::Off => {}
-    }
-
-    if brake {
-        buf[0..3].fill(colors::RED);
-        buf[STRIP_LEN - 3..STRIP_LEN].fill(colors::RED);
-        buf[16..32].fill(colors::RED);
+fn decrement(dur: &mut IndicatorDuration) {
+    match dur {
+        IndicatorDuration::INFINITE => {}
+        IndicatorDuration::FINITE(n) if *n > 0 => *n -= 1,
+        IndicatorDuration::FINITE(n) => {}
     }
 }
 
-#[entry]
+impl Decrement for RustIndicatorCommand {
+    fn decrement(&mut self) -> IndicatorState {
+        let current_state: IndicatorState;
+        match self {
+            RustIndicatorCommand::OFF => current_state = IndicatorState::OFF,
+            RustIndicatorCommand::LEFT(n) => {
+                current_state = IndicatorState::LEFT;
+                decrement(n);
+            }
+            RustIndicatorCommand::RIGHT(n) => {
+                current_state = IndicatorState::RIGHT;
+                decrement(n);
+            }
+            RustIndicatorCommand::BOTH(n) => {
+                current_state = IndicatorState::BOTH;
+                decrement(n);
+            }
+        }
+        return current_state;
+    }
+}
+#[app(device=rp_pico::hal::pac, dispatchers=[SW0_IRQ, SW1_IRQ, SW2_IRQ])]
+mod app {
+    use fugit::ExtU64;
+
+    use embedded_hal::digital::v2::ToggleableOutputPin;
+
+    use indicator_interface::{IndicatorState, RustIndicatorCommand};
+    use rp_pico::{
+        hal::{
+            self,
+            gpio::{pin::bank0::*, Pin, PushPullOutput},
+            timer::{monotonic::*, Alarm0},
+            Watchdog,
+        },
+        XOSC_CRYSTAL_FREQ,
+    };
+
+    use crate::animation::AnimationState;
+
+    #[monotonic(binds = TIMER_IRQ_0, default=true)]
+    type MyMono = Monotonic<Alarm0>;
+
+    #[shared]
+    struct Shared {
+        animation_state: AnimationState,
+        command: RustIndicatorCommand,
+    }
+
+    #[local]
+    struct Local {
+        led: Pin<Gpio25, PushPullOutput>,
+    }
+
+    #[init]
+    fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
+        // Soft-reset does not release the hardware spinlocks
+        // Release them now to avoid a deadlock after debug or watchdog reset
+        unsafe {
+            hal::sio::spinlock_reset();
+        }
+        let mut resets = c.device.RESETS;
+        let mut watchdog = Watchdog::new(c.device.WATCHDOG);
+        hal::clocks::init_clocks_and_plls(
+            XOSC_CRYSTAL_FREQ,
+            c.device.XOSC,
+            c.device.CLOCKS,
+            c.device.PLL_SYS,
+            c.device.PLL_USB,
+            &mut resets,
+            &mut watchdog,
+        )
+        .ok()
+        .unwrap();
+
+        let mut timer = hal::Timer::new(c.device.TIMER, &mut resets);
+        let alarm = timer.alarm_0().unwrap();
+
+        let sio = hal::Sio::new(c.device.SIO);
+        // Set the pins up according to their function on this particular board
+        let pins = rp_pico::Pins::new(
+            c.device.IO_BANK0,
+            c.device.PADS_BANK0,
+            sio.gpio_bank0,
+            &mut resets,
+        );
+        let led_pin = pins.led.into_push_pull_output();
+
+        blink_task::spawn().unwrap();
+
+        (
+            Shared {
+                animation_state: AnimationState::off(),
+                command: RustIndicatorCommand::OFF,
+            },
+            Local { led: led_pin },
+            init::Monotonics(Monotonic::new(timer, alarm)),
+        )
+    }
+
+    #[task(shared=[command], priority=2)]
+    fn indicate_task(mut c: indicate_task::Context) {
+        let mut mode = IndicatorState::OFF;
+        use crate::Decrement;
+        c.shared.command.lock(|command| mode = command.decrement());
+        let mode = mode;
+
+        // spawn first render task
+    }
+
+    #[task(shared=[animation_state], priority=3)]
+    fn animation_render_task(_: animation_render_task::Context) {
+        // if(there is a next frame):
+        animation_render_task::spawn_after(50.millis()).unwrap();
+        //animation_render_task::
+
+        // TODO: render frame
+    }
+
+    #[task(binds=I2C1_IRQ, priority=4)]
+    fn i2c_receive_task(_: i2c_receive_task::Context) {}
+
+    #[task(local=[led], priority=1)]
+    fn blink_task(c: blink_task::Context) {
+        blink_task::spawn_after(100.millis()).unwrap();
+
+        let led = c.local.led;
+        led.toggle().unwrap();
+    }
+}
+
+#[allow(unused)]
 fn main() -> ! {
     // Grab our singleton objects
     let mut pac = pac::Peripherals::take().unwrap();
@@ -143,10 +238,10 @@ fn main() -> ! {
         hal::I2C::new_peripheral_event_iterator(pac.I2C1, sda, scl, &mut pac.RESETS, 0x003);
 
     let mut t = 0u32;
-    let mut mode = Mode::Off;
+    let mut mode = IndicatorState::OFF;
     let mut brake = false;
 
-    let mut leds: [RGB8; STRIP_LEN] = [(0, 0, 0).into(); STRIP_LEN];
+    let mut leds: [RGB8; animation::STRIP_LEN] = [(0, 0, 0).into(); animation::STRIP_LEN];
 
     let strip_brightness: u8 = 20;
 
@@ -169,10 +264,10 @@ fn main() -> ! {
                 let mode_nr: u8 = read_buf[0] & 0b111;
 
                 mode = match mode_nr {
-                    0 => Mode::Off,
-                    1 => Mode::Both,
-                    2 => Mode::Left,
-                    3 => Mode::Right,
+                    0 => IndicatorState::OFF,
+                    1 => IndicatorState::BOTH,
+                    2 => IndicatorState::LEFT,
+                    3 => IndicatorState::RIGHT,
                     _ => mode,
                 }
             }
@@ -180,11 +275,11 @@ fn main() -> ! {
             None => {}
         }
 
-        calculate_frame(&mut leds, t, mode, brake);
+        animation::calculate_frame(&mut leds, t, &mode, brake);
         ws.write(brightness(leds.iter().copied(), strip_brightness))
             .unwrap();
 
         frame_delay.delay_ms(5);
-        t = (t + 5) % FRAME_DURATION;
+        t = (t + 5) % animation::FRAME_DURATION;
     }
 }
