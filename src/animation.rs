@@ -3,53 +3,74 @@ use smart_leds::{colors, RGB8};
 
 use indicator_interface::IndicatorState;
 
-pub type Duration = <rp2040_hal::timer::monotonic::Monotonic<rp2040_hal::timer::Alarm0> as rtic::Monotonic>::Duration;
-type Instant = <rp2040_hal::timer::monotonic::Monotonic<rp2040_hal::timer::Alarm0> as rtic::Monotonic>::Instant;
-
 use fugit::ExtU64;
 
-pub const ANIMATION_DURATION_ms: u64 = 500;
-pub const FRAME_DURATION_ms: u64 = 15;
+pub type Duration = <rp2040_hal::timer::monotonic::Monotonic<rp2040_hal::timer::Alarm0> as rtic::Monotonic>::Duration;
+
 pub const STRIP_LEN: usize = 16 * 3;
 
-pub fn calculate_frame(buf: &mut [RGB8; STRIP_LEN], t: u32, mode: &IndicatorState, brake: bool) {
+pub enum AnimationResult {
+    NextFrameIn(Duration),
+    // Returned for last frame
+    Done(Duration),
+}
+
+pub fn calculate_frame(
+    buf: &mut [RGB8; STRIP_LEN],
+    i: u32,
+    mode: &IndicatorState,
+    brake: bool,
+) -> AnimationResult {
     buf.fill(colors::BLACK);
 
-    let ANIMATION_DURATION:Duration = Duration::millis(ANIMATION_DURATION_ms);
-    let FRAME_DURATION:Duration = Duration::millis(FRAME_DURATION_ms);
+    let animation_duration: Duration = 700.millis();
+    let pixel_duration: Duration = 15.millis();
+    let hold_duration = animation_duration - 16 * pixel_duration;
 
-    match mode {
-        IndicatorState::LEFT => {
-            let progress = min(16, t) as usize;
-            buf[32..32 + progress].fill(colors::YELLOW);
-        }
-        IndicatorState::RIGHT => {
-            let progress = min(16, t) as usize;
-            buf[16 - progress..16].fill(colors::YELLOW);
-        }
-        IndicatorState::BOTH => {
-            buf[0..16].fill(
-                if (t as u64) < ((ANIMATION_DURATION / FRAME_DURATION) / 2) {
-                    colors::YELLOW
-                } else {
-                    colors::BLACK
-                },
-            );
+    let result = match mode {
+        IndicatorState::LEFT => match i {
+            0..=15 => {
+                let progress = min(16, i) as usize;
+                buf[32..32 + progress].fill(colors::YELLOW);
+                AnimationResult::NextFrameIn(pixel_duration)
+            }
+            16 => {
+                let progress = min(16, i) as usize;
+                buf[32..32 + progress].fill(colors::YELLOW);
+                AnimationResult::NextFrameIn(hold_duration)
+            }
+            _ => AnimationResult::Done(0.millis()),
+        },
+        IndicatorState::RIGHT => match i {
+            0..=15 => {
+                let progress = min(16, i) as usize;
+                buf[16 - progress..16].fill(colors::YELLOW);
+                AnimationResult::NextFrameIn(pixel_duration)
+            }
+            16 => {
+                let progress = min(16, i) as usize;
+                buf[16 - progress..16].fill(colors::YELLOW);
+                AnimationResult::NextFrameIn(hold_duration)
+            }
 
-            buf[STRIP_LEN - 16..STRIP_LEN].fill(
-                if (t as u64) < (ANIMATION_DURATION / FRAME_DURATION) / 2 {
-                    colors::YELLOW
-                } else {
-                    colors::BLACK
-                },
-            );
-        }
-        IndicatorState::OFF => {}
-    }
+            _ => AnimationResult::Done(0.millis()),
+        },
+        IndicatorState::BOTH => match i {
+            0 => {
+                buf[0..16].fill(colors::YELLOW);
+                buf[STRIP_LEN - 16..STRIP_LEN].fill(colors::YELLOW);
+                AnimationResult::NextFrameIn(animation_duration / 2)
+            }
+            _ => AnimationResult::Done(animation_duration / 2),
+        },
+        IndicatorState::OFF => AnimationResult::Done(0.millis()),
+    };
 
     if brake {
         buf[0..3].fill(colors::RED);
         buf[STRIP_LEN - 3..STRIP_LEN].fill(colors::RED);
         buf[16..32].fill(colors::RED);
-    }
+    };
+
+    result
 }
