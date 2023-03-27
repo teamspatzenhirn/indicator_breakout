@@ -1,9 +1,9 @@
 use core::cmp::min;
 use smart_leds::{colors, RGB8};
 
-use indicator_interface::IndicatorState;
-
 use fugit::ExtU64;
+
+use crate::IndicatorState;
 
 pub type Duration = <rp2040_hal::timer::monotonic::Monotonic<rp2040_hal::timer::Alarm0> as rtic::Monotonic>::Duration;
 
@@ -24,7 +24,7 @@ pub fn calculate_frame(
     buf.fill(colors::BLACK);
 
     let animation_duration: Duration = 700.millis();
-    let pixel_duration: Duration = 15.millis();
+    let pixel_duration: Duration = 21.millis();
     let hold_duration = animation_duration - 16 * pixel_duration;
 
     let result = match mode {

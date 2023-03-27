@@ -8,6 +8,7 @@ runner = "elf2uf2-rs -d"
 
 [dependencies]
 rp-pico = "0.7.0"
+# Is a dependency of rp-pico, this just adds rtic-monotonic feature
 rp2040-hal = { version = "*", features = ["rtic-monotonic"] }
 embedded-hal = "0.2.7"
 panic-halt = "0.2.0"
@@ -18,3 +19,4 @@ ws2812-pio = "0.6.0"
 smart-leds = "0.3.0"
 indicator_interface = { path = "../indicator_interface" }
 cortex-m-rtic = "1.1.4"
+heapless = "0.7.16"

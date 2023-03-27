@@ -562,6 +562,7 @@ dependencies = [
  "cortex-m-rtic",
  "embedded-hal",
  "fugit",
+ "heapless",
  "indicator_interface",
  "panic-halt",
  "rp-pico",

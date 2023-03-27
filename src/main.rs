@@ -3,11 +3,19 @@
 
 mod animation;
 
-use indicator_interface::{IndicatorDuration, IndicatorState, RustIndicatorCommand};
+use indicator_interface::{IndicatorDuration, RustIndicatorCommand};
+
 // Ensure we halt the program on panic
 use panic_halt as _;
 
 use rtic::app;
+
+pub enum IndicatorState {
+    OFF,
+    LEFT,
+    RIGHT,
+    BOTH,
+}
 
 fn state_from_command(c: &mut RustIndicatorCommand) -> IndicatorState {
     let (new_command, state): (RustIndicatorCommand, IndicatorState) = match c {
@@ -59,7 +67,7 @@ mod app {
     use crate::animation::{self};
     use core::ops::Deref;
     use hal::i2c::{SclPin, SdaPin};
-    use indicator_interface::RustIndicatorCommand;
+    use indicator_interface::{BrakeLightState, RustIndicatorCommand};
     use rp2040_hal::pio::PIOExt;
     use rp2040_hal::Clock;
     use rp2040_hal::{gpio::FunctionI2C, pac};
@@ -69,11 +77,12 @@ mod app {
             gpio::{pin::bank0::*, Pin},
             pio::SM0,
             timer::{monotonic::*, Alarm0},
-            Watchdog, I2C,
+            Watchdog,
         },
         XOSC_CRYSTAL_FREQ,
     };
 
+    use heapless;
     use smart_leds::SmartLedsWrite;
     use ws2812_pio::Ws2812Direct;
 
@@ -92,6 +101,7 @@ mod app {
         led_strip: Ws2812Direct<rp2040_hal::pac::PIO0, SM0, Gpio4>,
         frame_delay: cortex_m::delay::Delay,
         i2c: rp2040_hal::pac::I2C1,
+        decode_buffer: heapless::Vec<u8, 128>,
     }
 
     fn configure_i2c<
@@ -101,6 +111,7 @@ mod app {
     >(
         i2c: I2C,
         resets: &pac::RESETS,
+        interrupt: pac::Interrupt,
         slave_address: u8,
         _sda_pin: Pin<Sda, FunctionI2C>,
         _scl_pin: Pin<Scl, FunctionI2C>,
@@ -129,8 +140,28 @@ mod app {
                 .slave_enabled()
         });
 
-        // TODO: setup fifo?
-        // TODO: setup interrupts?
+        // Setup fifo
+
+        // hold bus when rx fifo is full
+        i2c.ic_con
+            .modify(|_, w| w.rx_fifo_full_hld_ctrl().enabled());
+
+        // "enabled" means "masking enabled" here, which means the interrupt will *not* fire
+        i2c.ic_intr_mask.modify(|_, w| {
+            // We dont use generall call
+            w.m_gen_call()
+                .enabled()
+                // We dont transmit
+                .m_tx_over()
+                .enabled()
+                .m_tx_abrt()
+                .enabled()
+                .m_tx_empty()
+                .enabled()
+        });
+
+        // Setup interrupt
+        unsafe { pac::NVIC::unmask(interrupt) }
 
         // Enable i2c1
         i2c.ic_enable.modify(|_, w| w.enable().enabled());
@@ -193,11 +224,22 @@ mod app {
         scl.set_drive_strength(hal::gpio::OutputDriveStrength::TwoMilliAmps);
         sda.set_drive_strength(hal::gpio::OutputDriveStrength::TwoMilliAmps);
 
-        let i2c = configure_i2c(c.device.I2C1, &resets, 0x9, sda, scl);
+        let i2c = configure_i2c(
+            c.device.I2C1,
+            &resets,
+            pac::interrupt::I2C1_IRQ,
+            0x9,
+            sda,
+            scl,
+        );
+
+        indicate_task::spawn().unwrap();
 
         (
             Shared {
-                next_command: None,
+                next_command: Some(RustIndicatorCommand::LEFT(
+                    indicator_interface::IndicatorDuration::INFINITE,
+                )),
                 brakelight: false,
                 leds: [smart_leds::colors::BLACK; animation::STRIP_LEN],
             },
@@ -205,6 +247,7 @@ mod app {
                 led_strip,
                 frame_delay,
                 i2c,
+                decode_buffer: heapless::Vec::new(),
             },
             init::Monotonics(Monotonic::new(timer, alarm)),
         )
@@ -266,32 +309,101 @@ mod app {
         c.shared.leds.lock(|leds| {
             c.local
                 .led_strip
-                .write(smart_leds::brightness(leds.iter().copied(), 20))
+                .write(smart_leds::brightness(
+                    smart_leds::gamma(leds.iter().copied()),
+                    10,
+                ))
                 .unwrap()
         });
     }
 
-    #[task(binds=I2C1_IRQ, priority=4, shared=[next_command, brakelight], local=[i2c])]
+    #[task(binds=I2C1_IRQ, priority=4, shared=[next_command, brakelight], local=[i2c, decode_buffer])]
     fn i2c_receive_task(mut c: i2c_receive_task::Context) {
         let i2c = c.local.i2c;
+
+        let mut interrupt_handled = false;
+
+        /*
+        R_GEN_CALL: Interrupt masked, see config function
+        R_TX_OVER: Masked, we don't transmit
+        R_TX_ABRT: Masked, we don't transmit
+        R_TX_EMPTY: Masked, we don't transmit
+        */
+
+        if i2c.ic_intr_stat.read().r_rx_under().is_active() {
+            // Occurs if we try to read from fifo when it's empty. We shouldn't do this i guess...
+            panic!();
+        }
+
+        if i2c.ic_intr_stat.read().r_rx_over().is_active() {
+            // We configure RX_FIFO_FULL_HLD_CTRL, so this interrupt never occurs
+            panic!();
+        }
+
+        if i2c.ic_intr_stat.read().r_rd_req().is_active() {
+            // We don't have any data for master, but not clearing this IRQ holds bus in wait state...
+            // Let's hope this sends a NAK or something? Maybe releases the bus at least?
+            i2c.ic_clr_rd_req.read().clr_rd_req().bit();
+            interrupt_handled = true;
+        }
+
         if i2c.ic_intr_stat.read().r_rx_full().is_active() {
-            // TODO: read rx fifo into some buffer
+            let data_reg = i2c.ic_data_cmd.read();
+            let is_first = data_reg.first_data_byte().is_active();
+            if is_first {
+                c.local.decode_buffer.clear();
+            }
+
+            let data = data_reg.dat().bits();
+            c.local
+                .decode_buffer
+                .push(data)
+                .expect("Decode buffer too small!");
+
+            // Interrupt is automatically cleared when buffer level goes below threshold.
+            interrupt_handled = true;
         }
 
         if i2c.ic_intr_stat.read().r_rx_done().is_active() {
-            // TODO: read rx fifo into some buffer
-            // TODO: decode message
+            let data_reg = i2c.ic_data_cmd.read();
+            let is_first = data_reg.first_data_byte().is_active();
+            if is_first {
+                c.local.decode_buffer.clear();
+            }
 
-            // TODO: update next task
-            // TODO: update brakelight
+            let data = data_reg.dat().bits();
+            c.local
+                .decode_buffer
+                .push(data)
+                .expect("Decode buffer too small!");
 
-            c.shared.next_command.lock(|nc| {
-                *nc = Some(RustIndicatorCommand::BOTH(
-                    indicator_interface::IndicatorDuration::FINITE(3),
-                ))
-            });
+            let decoding_result = indicator_interface::postcard::from_bytes::<
+                indicator_interface::I2CMessage,
+            >(c.local.decode_buffer);
+            if let Ok(message) = decoding_result {
+                match message {
+                    indicator_interface::I2CMessage::BrakeLight(bl) => {
+                        c.shared.brakelight.lock(|b| {
+                            *b = match bl {
+                                BrakeLightState::ON => true,
+                                BrakeLightState::OFF => false,
+                            }
+                        })
+                    }
+                    indicator_interface::I2CMessage::Indicator(command) => {
+                        c.shared.next_command.lock(|nc| *nc = Some(command));
+                        indicate_task::spawn().unwrap();
+                    }
+                }
+            }
+
+            i2c.ic_clr_rx_done.read().clr_rx_done().bit();
+            interrupt_handled = true;
         }
 
-        // TODO: handle other interrupts. Default unmasked interrupts: R_GEN_CALL, R_RX_DONE, R_TX_ABRT, R_RD_REQ, R_TX_EMPTY, R_TX_OVER, R_RX_FULL, R_RX_OVER, R_RX_UNDER
+        if !interrupt_handled {
+            // TODO: Add some error handling here, so we can tell if some unexpected interrupt occurred...
+            panic!();
+        }
     }
 }
