@@ -348,17 +348,19 @@ mod app {
         }
 
         if i2c.ic_intr_stat.read().r_rx_full().is_active() {
-            let data_reg = i2c.ic_data_cmd.read();
-            let is_first = data_reg.first_data_byte().is_active();
-            if is_first {
-                c.local.decode_buffer.clear();
-            }
+            while i2c.ic_rxflr.read().rxflr().bits() > 0 {
+                let data_reg = i2c.ic_data_cmd.read();
+                let is_first = data_reg.first_data_byte().is_active();
+                if is_first {
+                    c.local.decode_buffer.clear();
+                }
 
-            let data = data_reg.dat().bits();
-            c.local
-                .decode_buffer
-                .push(data)
-                .expect("Decode buffer too small!");
+                let data = data_reg.dat().bits();
+                c.local
+                    .decode_buffer
+                    .push(data)
+                    .expect("Decode buffer too small!");
+            }
 
             // Interrupt is automatically cleared when buffer level goes below threshold.
             interrupt_handled = true;
