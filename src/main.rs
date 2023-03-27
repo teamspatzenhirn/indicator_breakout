@@ -57,16 +57,19 @@ fn state_from_command(c: &mut RustIndicatorCommand) -> IndicatorState {
 #[app(device=rp_pico::hal::pac, dispatchers=[SW0_IRQ, SW1_IRQ, SW2_IRQ])]
 mod app {
     use crate::animation::{self};
+    use core::ops::Deref;
+    use hal::i2c::{SclPin, SdaPin};
     use indicator_interface::RustIndicatorCommand;
     use rp2040_hal::pio::PIOExt;
     use rp2040_hal::Clock;
+    use rp2040_hal::{gpio::FunctionI2C, pac};
     use rp_pico::{
         hal::{
             self,
-            gpio::pin::bank0::*,
+            gpio::{pin::bank0::*, Pin},
             pio::SM0,
             timer::{monotonic::*, Alarm0},
-            Watchdog,
+            Watchdog, I2C,
         },
         XOSC_CRYSTAL_FREQ,
     };
@@ -88,6 +91,51 @@ mod app {
     struct Local {
         led_strip: Ws2812Direct<rp2040_hal::pac::PIO0, SM0, Gpio4>,
         frame_delay: cortex_m::delay::Delay,
+        i2c: rp2040_hal::pac::I2C1,
+    }
+
+    fn configure_i2c<
+        I2C: Deref<Target = pac::i2c0::RegisterBlock>,
+        Sda: hal::gpio::PinId + BankPinId,
+        Scl: hal::gpio::PinId + BankPinId,
+    >(
+        i2c: I2C,
+        resets: &pac::RESETS,
+        slave_address: u8,
+        _sda_pin: Pin<Sda, FunctionI2C>,
+        _scl_pin: Pin<Scl, FunctionI2C>,
+    ) -> I2C
+    where
+        Sda: SdaPin<I2C>,
+        Scl: SclPin<I2C>,
+    {
+        // Reset i2c1 module
+        resets.reset.modify(|_, w| w.i2c1().set_bit());
+        resets.reset.modify(|_, w| w.i2c1().clear_bit());
+        while resets.reset_done.read().i2c1().bit_is_clear() {}
+
+        // Disable i2c1
+        i2c.ic_enable.write(|w| w.enable().disabled());
+
+        // Set slave address
+        i2c.ic_sar
+            .modify(|_, w| unsafe { w.ic_sar().bits(slave_address as u16) });
+
+        // Select 7-bit addressing, enable slave-only mode
+        i2c.ic_con.modify(|_, w| {
+            w.ic_10bitaddr_slave()
+                .addr_7bits()
+                .ic_slave_disable()
+                .slave_enabled()
+        });
+
+        // TODO: setup fifo?
+        // TODO: setup interrupts?
+
+        // Enable i2c1
+        i2c.ic_enable.modify(|_, w| w.enable().enabled());
+
+        i2c
     }
 
     #[init]
@@ -139,6 +187,14 @@ mod app {
         let frame_delay =
             cortex_m::delay::Delay::new(c.core.SYST, clocks.system_clock.freq().to_Hz());
 
+        // Configure pinmuxing
+        let mut sda = pins.gpio18.into_mode::<hal::gpio::FunctionI2C>();
+        let mut scl = pins.gpio19.into_mode::<hal::gpio::FunctionI2C>();
+        scl.set_drive_strength(hal::gpio::OutputDriveStrength::TwoMilliAmps);
+        sda.set_drive_strength(hal::gpio::OutputDriveStrength::TwoMilliAmps);
+
+        let i2c = configure_i2c(c.device.I2C1, &resets, 0x9, sda, scl);
+
         (
             Shared {
                 next_command: None,
@@ -148,6 +204,7 @@ mod app {
             Local {
                 led_strip,
                 frame_delay,
+                i2c,
             },
             init::Monotonics(Monotonic::new(timer, alarm)),
         )
@@ -214,15 +271,27 @@ mod app {
         });
     }
 
-    #[task(binds=I2C1_IRQ, priority=4, shared=[next_command, brakelight])]
+    #[task(binds=I2C1_IRQ, priority=4, shared=[next_command, brakelight], local=[i2c])]
     fn i2c_receive_task(mut c: i2c_receive_task::Context) {
-        // TODO: update next task
-        // TODO: update brakelight
+        let i2c = c.local.i2c;
+        if i2c.ic_intr_stat.read().r_rx_full().is_active() {
+            // TODO: read rx fifo into some buffer
+        }
 
-        c.shared.next_command.lock(|nc| {
-            *nc = Some(RustIndicatorCommand::BOTH(
-                indicator_interface::IndicatorDuration::FINITE(3),
-            ))
-        });
+        if i2c.ic_intr_stat.read().r_rx_done().is_active() {
+            // TODO: read rx fifo into some buffer
+            // TODO: decode message
+
+            // TODO: update next task
+            // TODO: update brakelight
+
+            c.shared.next_command.lock(|nc| {
+                *nc = Some(RustIndicatorCommand::BOTH(
+                    indicator_interface::IndicatorDuration::FINITE(3),
+                ))
+            });
+        }
+
+        // TODO: handle other interrupts. Default unmasked interrupts: R_GEN_CALL, R_RX_DONE, R_TX_ABRT, R_RD_REQ, R_TX_EMPTY, R_TX_OVER, R_RX_FULL, R_RX_OVER, R_RX_UNDER
     }
 }
