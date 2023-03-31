@@ -81,6 +81,7 @@ mod app {
         },
         XOSC_CRYSTAL_FREQ,
     };
+    use rtt_target::{rprintln, rtt_init_print};
 
     use heapless;
     use smart_leds::SmartLedsWrite;
@@ -102,6 +103,7 @@ mod app {
         frame_delay: cortex_m::delay::Delay,
         i2c: rp2040_hal::pac::I2C1,
         decode_buffer: heapless::Vec<u8, 128>,
+        led: Pin<Gpio25, hal::gpio::PushPullOutput>,
     }
 
     fn configure_i2c<
@@ -171,6 +173,8 @@ mod app {
 
     #[init]
     fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
+        rtt_init_print!();
+
         // Soft-reset does not release the hardware spinlocks
         // Release them now to avoid a deadlock after debug or watchdog reset
         unsafe {
@@ -201,6 +205,8 @@ mod app {
             sio.gpio_bank0,
             &mut resets,
         );
+
+        let led_pin = pins.led.into_push_pull_output();
 
         // Split the PIO state machine 0 into individual objects, so that
         // Ws2812 can use it:
@@ -233,7 +239,8 @@ mod app {
             scl,
         );
 
-        indicate_task::spawn().unwrap();
+        //indicate_task::spawn().unwrap();
+        blink_task::spawn().unwrap();
 
         (
             Shared {
@@ -248,6 +255,7 @@ mod app {
                 frame_delay,
                 i2c,
                 decode_buffer: heapless::Vec::new(),
+                led: led_pin,
             },
             init::Monotonics(Monotonic::new(timer, alarm)),
         )
@@ -315,6 +323,20 @@ mod app {
                 ))
                 .unwrap()
         });
+    }
+
+    #[task(local=[led], priority=4)]
+    fn blink_task(c: blink_task::Context) {
+        use embedded_hal::digital::v2::ToggleableOutputPin;
+        use fugit::ExtU64;
+        blink_task::spawn_after(500.millis()).unwrap();
+        c.local.led.toggle().unwrap();
+        rprintln!("Hello!");
+    }
+
+    #[idle]
+    fn idle(_ctx: idle::Context) -> ! {
+        loop {}
     }
 
     #[task(binds=I2C1_IRQ, priority=4, shared=[next_command, brakelight], local=[i2c, decode_buffer])]
