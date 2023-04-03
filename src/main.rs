@@ -4,9 +4,7 @@
 mod animation;
 
 use indicator_interface::{IndicatorDuration, RustIndicatorCommand};
-
-// Ensure we halt the program on panic
-use panic_halt as _;
+use panic_rtt_target as _;
 
 use rtic::app;
 
@@ -42,7 +40,7 @@ fn state_from_command(c: &mut RustIndicatorCommand) -> IndicatorState {
                     RustIndicatorCommand::RIGHT(IndicatorDuration::FINITE(*c - 1))
                 }
             },
-            IndicatorState::LEFT,
+            IndicatorState::RIGHT,
         ),
         RustIndicatorCommand::BOTH(c) => (
             match c {
@@ -140,6 +138,9 @@ mod app {
                 .addr_7bits()
                 .ic_slave_disable()
                 .slave_enabled()
+                // Only issue stop_det interrupt if we are currently addressed
+                .stop_det_ifaddressed()
+                .enabled()
         });
 
         // Setup fifo
@@ -147,6 +148,9 @@ mod app {
         // hold bus when rx fifo is full
         i2c.ic_con
             .modify(|_, w| w.rx_fifo_full_hld_ctrl().enabled());
+
+        // Set rx fifo threshold to maximum (default: 1)
+        i2c.ic_rx_tl.modify(|_, w| unsafe { w.rx_tl().bits(15) });
 
         // "enabled" means "masking enabled" here, which means the interrupt will *not* fire
         i2c.ic_intr_mask.modify(|_, w| {
@@ -160,7 +164,12 @@ mod app {
                 .enabled()
                 .m_tx_empty()
                 .enabled()
+                // Stop det interrupt: needed to detect end of transmission
+                .m_stop_det()
+                .disabled()
         });
+
+        rprintln!("Set ic_intr_mask: {:#032b}", i2c.ic_intr_mask.read().bits());
 
         // Setup interrupt
         unsafe { pac::NVIC::unmask(interrupt) }
@@ -261,7 +270,7 @@ mod app {
         )
     }
 
-    #[task(shared=[next_command, brakelight, leds], local=[frame_delay], priority=2)]
+    #[task(shared=[next_command, brakelight, leds], local=[frame_delay], priority=2, capacity=100)]
     fn indicate_task(mut c: indicate_task::Context) {
         let mut i = 0;
 
@@ -312,7 +321,7 @@ mod app {
         indicate_task::spawn().unwrap();
     }
 
-    #[task(priority=4, shared=[leds], local=[led_strip])]
+    #[task(priority=3, shared=[leds], local=[led_strip])]
     fn led_write_task(mut c: led_write_task::Context) {
         c.shared.leds.lock(|leds| {
             c.local
@@ -325,13 +334,12 @@ mod app {
         });
     }
 
-    #[task(local=[led], priority=4)]
+    #[task(local=[led], priority=3)]
     fn blink_task(c: blink_task::Context) {
         use embedded_hal::digital::v2::ToggleableOutputPin;
         use fugit::ExtU64;
         blink_task::spawn_after(500.millis()).unwrap();
         c.local.led.toggle().unwrap();
-        rprintln!("Hello!");
     }
 
     #[idle]
@@ -341,6 +349,8 @@ mod app {
 
     #[task(binds=I2C1_IRQ, priority=4, shared=[next_command, brakelight], local=[i2c, decode_buffer])]
     fn i2c_receive_task(mut c: i2c_receive_task::Context) {
+        rprintln!("Entering I2C IRQ!");
+
         let i2c = c.local.i2c;
 
         let mut interrupt_handled = false;
@@ -352,59 +362,63 @@ mod app {
         R_TX_EMPTY: Masked, we don't transmit
         */
 
-        if i2c.ic_intr_stat.read().r_rx_under().is_active() {
+        let intr_stat = i2c.ic_intr_stat.read();
+        let intr_stat_raw = i2c.ic_raw_intr_stat.read();
+
+        if intr_stat.r_rx_under().is_active() {
             // Occurs if we try to read from fifo when it's empty. We shouldn't do this i guess...
             panic!();
         }
 
-        if i2c.ic_intr_stat.read().r_rx_over().is_active() {
+        if intr_stat.r_rx_over().is_active() {
             // We configure RX_FIFO_FULL_HLD_CTRL, so this interrupt never occurs
             panic!();
         }
 
-        if i2c.ic_intr_stat.read().r_rd_req().is_active() {
+        if intr_stat.r_rd_req().is_active() {
             // We don't have any data for master, but not clearing this IRQ holds bus in wait state...
             // Let's hope this sends a NAK or something? Maybe releases the bus at least?
             i2c.ic_clr_rd_req.read().clr_rd_req().bit();
             interrupt_handled = true;
         }
 
-        if i2c.ic_intr_stat.read().r_rx_full().is_active() {
-            while i2c.ic_rxflr.read().rxflr().bits() > 0 {
-                let data_reg = i2c.ic_data_cmd.read();
-                let is_first = data_reg.first_data_byte().is_active();
-                if is_first {
-                    c.local.decode_buffer.clear();
-                }
-
-                let data = data_reg.dat().bits();
-                c.local
-                    .decode_buffer
-                    .push(data)
-                    .expect("Decode buffer too small!");
-            }
-
+        if intr_stat.r_rx_full().is_active() {
+            rprintln!("RX FIFO full!");
             // Interrupt is automatically cleared when buffer level goes below threshold.
             interrupt_handled = true;
         }
 
-        if i2c.ic_intr_stat.read().r_rx_done().is_active() {
+        // Always read all the data we can get
+        while i2c.ic_rxflr.read().rxflr().bits() > 0 {
+            rprintln!("Reading byte");
             let data_reg = i2c.ic_data_cmd.read();
             let is_first = data_reg.first_data_byte().is_active();
+            if is_first {
+                rprintln!("(Is first byte)",);
+            }
+
             if is_first {
                 c.local.decode_buffer.clear();
             }
 
             let data = data_reg.dat().bits();
+            rprintln!("Data: {}", data);
             c.local
                 .decode_buffer
                 .push(data)
                 .expect("Decode buffer too small!");
+        }
+
+        if intr_stat.r_stop_det().is_active() {
+            rprintln!("RX done!");
+            // Clear flag
+            let _ = i2c.ic_clr_stop_det.read();
 
             let decoding_result = indicator_interface::postcard::from_bytes::<
                 indicator_interface::I2CMessage,
             >(c.local.decode_buffer);
             if let Ok(message) = decoding_result {
+                rprintln!("Received message: {:?}", message);
                 match message {
                     indicator_interface::I2CMessage::BrakeLight(bl) => {
                         c.shared.brakelight.lock(|b| {
@@ -426,8 +440,10 @@ mod app {
         }
 
         if !interrupt_handled {
+            rprintln!("Unknown interrupt reason!");
+            rprintln!("Raw ic_intr_stat: {:#032b}", intr_stat.bits());
+            rprintln!("Raw ic_raw_intr_stat: {:#032b}", intr_stat_raw.bits());
             // TODO: Add some error handling here, so we can tell if some unexpected interrupt occurred...
-            panic!();
         }
     }
 }

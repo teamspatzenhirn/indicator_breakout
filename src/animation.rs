@@ -23,7 +23,7 @@ pub fn calculate_frame(
 ) -> AnimationResult {
     buf.fill(colors::BLACK);
 
-    let animation_duration: Duration = 700.millis();
+    let animation_duration: Duration = 500.millis();
     let pixel_duration: Duration = 21.millis();
     let hold_duration = animation_duration - 16 * pixel_duration;
 
